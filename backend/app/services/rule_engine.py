@@ -10,11 +10,12 @@ class RuleEngine:
         
         rules = self.db.query(Rule).filter(Rule.is_active == True).all()
         
+        result = {}
+        
         for rule in rules:
             try:
                 condition_result = eval(rule.condition, {}, data)
 
-                result = {}
 
                 if condition_result:
                     action_parts = rule.action.split('=', 1)
