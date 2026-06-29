@@ -1,4 +1,3 @@
-# app/services/rule_service.py
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from typing import List, Optional

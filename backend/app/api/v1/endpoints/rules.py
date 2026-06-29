@@ -1,7 +1,6 @@
 # app/api/rules.py
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from typing import List
 
 from app.core.connection import get_db
 from app.schemas.rule import RuleCreate, RuleUpdate, RuleResponse, RuleList
