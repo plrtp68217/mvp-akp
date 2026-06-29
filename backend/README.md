@@ -5,12 +5,15 @@
 > автоматический расчёт скидок). Реализован на **FastAPI + SQLAlchemy**.
 
 ---
+### TODO
 Пользователю в UI будет предоставляться:
 
-набор переменных: total, discount, ...
-набор операторов: +, -, *, :
+- набор переменных: total, discount и т.д.
+- набор операторов: +, -, * и т.д.
+
 И с помощью них он будет строить условия и действия:
 
+```python
 condition: total > 1000
 action: discount = total * 0.8
 rule.action = "discount = total * 0.1"
@@ -19,6 +22,9 @@ rule.action = "discount = total * 0.1"
 # field = 'discount'
 # value = eval('total * 0.1', {}, result)  # 1500 * 0.1 = 150
 # result['discount'] = 150
+```
+
+```python
 rule.action = "order.discount = 10"
 # action_parts = ['order.discount ', ' 10']
 # field = 'order.discount'
@@ -30,7 +36,9 @@ result = {
     "client_type": "vip",
     "discount": 0
 }
+```
 
+```python
 # Правило из БД
 rule.action = "discount = total * 0.1"
 
@@ -43,7 +51,7 @@ if len(action_parts) == 2:
 
 print(result)
 # {'total': 1500, 'client_type': 'vip', 'discount': 150}
-
+```
 ---
 
 ## 📖 О проекте
