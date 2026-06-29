@@ -5,7 +5,7 @@ from typing import List
 
 from app.core.connection import get_db
 from app.schemas.rule import RuleCreate, RuleUpdate, RuleResponse, RuleList
-from app.services import RuleService
+from app.services.rule_service import RuleService
 
 router = APIRouter(prefix="/api/rules", tags=["rules"])
 

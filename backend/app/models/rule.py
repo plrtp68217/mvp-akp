@@ -1,7 +1,7 @@
 from sqlalchemy import Column, Integer, String, Boolean, DateTime
 from sqlalchemy.sql import func
 
-from backend.app.core.connection import Base
+from app.core.connection import Base
 
 class Rule(Base):
     __tablename__ = "rules"

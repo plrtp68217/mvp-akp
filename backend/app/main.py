@@ -11,5 +11,3 @@ app.include_router(rules.router)
 @app.get("/")
 def read_root():
     return {"Hello": "World"}
-
-
