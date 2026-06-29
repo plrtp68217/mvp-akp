@@ -7,7 +7,7 @@ from app.core.connection import get_db
 from app.schemas.rule import RuleCreate, RuleUpdate, RuleResponse, RuleList
 from app.services.rule_service import RuleService
 
-router = APIRouter(prefix="/api/rules", tags=["rules"])
+router = APIRouter(prefix="/rules", tags=["rules"])
 
 @router.post("/", response_model=RuleResponse, status_code=201)
 def create_rule(
