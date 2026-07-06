@@ -1,28 +1,26 @@
-from pydantic import BaseModel
-from typing import Optional, List
 from datetime import datetime
+from typing import Any, Dict, Optional
 
-class OrderItem(BaseModel):
-    product_name: str
-    quantity: int
-    price: float
+from pydantic import BaseModel, Field
+
 
 class OrderCreate(BaseModel):
-    client_id: int
-    client_type: Optional[str] = None
-    items: List[OrderItem]
-    shipping_address: str
+    total: float = Field(..., ge=0, description="Сумма заказа (системная переменная)")
+    status: str = "pending"
+    items_count: int = Field(0, ge=0, description="Количество товаров")
+    # Источник значений для кастомных переменных.
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
 
 class OrderResponse(BaseModel):
     id: int
-    client_id: int
-    total_amount: float
-    discount: float = 0
-    final_amount: float
+    total: float
     status: str
-    shipping_address: str
+    items_count: int
+    metadata_json: Dict[str, Any]
     created_at: datetime
-    applied_rules: Optional[List[str]] = None
-    
+    # Результат применённых движком действий, напр. {"discount": 600}.
+    applied_actions: Dict[str, Any] = Field(default_factory=dict)
+
     class Config:
         from_attributes = True

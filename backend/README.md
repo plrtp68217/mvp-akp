@@ -1,442 +1,391 @@
-# MVP AKP — Backend (Конфигурируемый движок бизнес-правил)
+# MVP AKP — Backend (Rule Engine для заказов)
 
-> **AKP** — MVP-сервис, позволяющий пользователю описывать бизнес-правила
-> (условие → действие) через UI и применять их к заказам (например,
-> автоматический расчёт скидок). Реализован на **FastAPI + SQLAlchemy**.
+Бекенд системы, где администратор через UI-конструктор создаёт правила вида
+`condition → action`, а при оформлении заказа движок прогоняет активные правила и
+возвращает результат применённых действий (например, `{"discount": 600}`).
+
+Правила хранятся как **JSON-структуры** (не строковый DSL) и исполняются безопасно —
+**без `eval()`**.
 
 ---
-### TODO
-Пользователю в UI будет предоставляться:
 
-- набор переменных: total, discount и т.д.
-- набор операторов: +, -, * и т.д.
+## Стек
 
-И с помощью них он будет строить условия и действия:
+- **FastAPI** — HTTP API
+- **SQLAlchemy 2.x** — ORM
+- **SQLite** — хранилище (dev/MVP)
+- **Pydantic v2** — валидация схем
+- **pytest** — юнит-тесты движка
 
-```python
-condition: total > 1000
-action: discount = total * 0.8
-rule.action = "discount = total * 0.1"
-# result = {'total': 1500, 'discount': 0}
-# action_parts = ['discount ', ' total * 0.1']
-# field = 'discount'
-# value = eval('total * 0.1', {}, result)  # 1500 * 0.1 = 150
-# result['discount'] = 150
+---
+
+## Архитектура
+
+Зависимости строго в одну сторону:
+
+```
+routers (app/api/v1/endpoints) → services → engine/registry → models
 ```
 
-```python
-rule.action = "order.discount = 10"
-# action_parts = ['order.discount ', ' 10']
-# field = 'order.discount'
-# value = 10
-# result['order.discount'] = 10  # Установит плоский ключ
-# Исходные данные
-result = {
-    "total": 1500,
-    "client_type": "vip",
-    "discount": 0
+`registry.py` и `rule_engine.py` — **чистый Python**: не импортируют FastAPI, ничего не
+знают про HTTP, что позволяет тестировать движок без поднятия сервера/БД.
+
+```
+app/
+├── main.py                       # создание FastAPI-приложения, init БД
+├── core/
+│   ├── config.py                 # Settings (DATABASE_URL)
+│   └── connection.py             # engine, SessionLocal, Base, get_db, init_database
+├── models/
+│   ├── order.py                  # Order (системные переменные + metadata_json)
+│   ├── rule.py                   # Rule (condition/action = JSON, priority)
+│   └── custom_variable.py        # CustomVariable
+├── schemas/
+│   ├── order.py                  # OrderCreate/OrderResponse
+│   ├── rule.py                   # ConditionBlock/ActionBlock/RuleCreate/...
+│   └── variable.py               # CustomVariableCreate/VariableList/...
+├── services/
+│   ├── registry.py               # SYSTEM_VARIABLES, build_registry, get_nested, coerce_value
+│   ├── rule_engine.py            # build_context, evaluate_condition, execute_actions, apply_rules
+│   ├── rule_service.py           # CRUD правил, validate_rule_variables, process_order
+│   └── variable_service.py       # CRUD кастомных переменных, мягкое удаление
+└── api/v1/
+    ├── router.py                 # сборка роутеров под /api/v1
+    └── endpoints/
+        ├── rules.py              # /rules
+        ├── variables.py          # /variables
+        └── orders.py             # /orders
+```
+
+---
+
+## Модель данных
+
+### `orders`
+| Поле | Тип | Назначение |
+|---|---|---|
+| id | Integer, PK | ID заказа |
+| total | Float | Сумма заказа — **системная переменная** |
+| status | String | Статус — **системная переменная** |
+| items_count | Integer | Кол-во товаров — **системная переменная** |
+| metadata_json | JSON | Расширяемое хранилище (источник кастомных переменных) |
+| created_at | DateTime | Дата создания |
+
+### `rules`
+| Поле | Тип | Назначение |
+|---|---|---|
+| id | Integer, PK | ID правила |
+| name | String | Название для админа (в логике не участвует) |
+| condition | JSON | `{"operator": "AND"\|"OR", "conditions": [...]}` |
+| action | JSON | `{"actions": [...]}` |
+| priority | Integer | Порядок применения (меньше = раньше), default `100` |
+| is_active | Boolean | Включено ли правило |
+| created_at / updated_at | DateTime | Служебные |
+
+### `custom_variables`
+| Поле | Тип | Назначение |
+|---|---|---|
+| id | Integer, PK | ID переменной |
+| key | String, unique | Техническое имя (regex `^[a-z_][a-z0-9_]*$`) |
+| label | String | Человекочитаемое имя для UI |
+| value_type | String | `number` \| `string` \| `boolean` |
+| source_path | String, nullable | Путь в `orders.metadata_json` (точечная нотация). **Пусто** — для выходных переменных (только `target`) |
+| enum_values | JSON, nullable | Список допустимых строковых значений (только при `value_type == string`) |
+| is_active | Boolean | Мягкое включение/отключение |
+| created_at / updated_at | DateTime | Служебные |
+
+---
+
+## Переменные
+
+Гибридная модель:
+
+- **Системные** — прямые поля `orders` (`total`, `status`, `items_count`), описаны в коде
+  (`SYSTEM_VARIABLES` в `registry.py`), меняются только разработчиком.
+- **Кастомные** — заводятся админом, значения берутся из `orders.metadata_json` по
+  `source_path` и приводятся к заявленному типу (`coerce_value`) — сырым данным не доверяем.
+- **Выходные** — частный случай кастомных **без `source_path`**: ниоткуда не читаются,
+  используются только как `action.target`. Нужны, чтобы фронт знал `label`/`value_type`
+  и корректно подписал результат прогона.
+
+Удаление кастомной переменной — **мягкое** (`is_active=False`), чтобы не ломать правила,
+которые на неё ссылаются.
+
+---
+
+## Формат правил
+
+### Условие (`condition`) — плоский список с AND/OR (без вложенности)
+
+```json
+{
+  "operator": "AND",
+  "conditions": [
+    {"variable": "total", "op": ">", "value": 5000},
+    {"variable": "loyalty_level", "op": "==", "value": "gold"}
+  ]
 }
 ```
 
-```python
-# Правило из БД
-rule.action = "discount = total * 0.1"
+Операторы сравнения (фиксированный enum): `>`, `<`, `>=`, `<=`, `==`, `!=`.
 
-# Обработка
-action_parts = rule.action.split('=', 1)
-if len(action_parts) == 2:
-    field = action_parts[0].strip()  # 'discount'
-    value = eval(action_parts[1].strip(), {}, result)  # eval('total * 0.1', {}, result) → 150
-    result[field] = value  # result['discount'] = 150
+### Действие (`action`)
 
-print(result)
-# {'total': 1500, 'client_type': 'vip', 'discount': 150}
+```json
+{
+  "actions": [
+    {"target": "discount", "op": "percent_of", "source": "total", "value": 10}
+  ]
+}
 ```
----
 
-## 📖 О проекте
+Операции (фиксированный enum):
 
-### Назначение и цели
-Проект представляет собой **бэкенд конфигурируемого движка правил** (rule engine).
-Идея: бизнес-пользователь (не программист) через интерфейс задаёт правила вида
-«если *условие*, то выполнить *действие*», а система применяет их к входящим
-заказам.
+| op | Смысл | Операнд |
+|---|---|---|
+| `set` | записать значение | литерал `value` или значение переменной `source` |
+| `add` | прибавить | `operand + value` |
+| `subtract` | вычесть | `operand - value` |
+| `multiply` | умножить | `operand * value` |
+| `percent_of` | процент от | `operand * value / 100` |
 
-Пример правила (из `backend/README.md`):
-- **condition:** `total > 1000`
-- **action:** `discount = total * 0.1`
-
-При создании заказа на сумму `1500` сработает правило и вернётся
-`{"discount": 150}`.
-
-### Основной функционал
-- **CRUD-управление правилами** (`/api/v1/rules`): создание, чтение, обновление,
-  удаление, включение/выключение, пагинация и фильтрация по активности.
-- **Создание заказа** (`/api/v1/orders`): подсчёт суммы заказа и прогон через
-  движок правил с возвратом применённых действий.
-- **Движок правил** (`RuleEngine`): динамическое вычисление условий и действий,
-  заданных строками.
-
-### Для кого предназначено
-- Внутренний инструмент / MVP для демонстрации концепции «no-code» правил
-  ценообразования и скидок.
-- Учебный / диссертационный прототип (проект расположен в каталоге `_DISSER`).
-
-### Ключевые особенности
-- Версионирование API (`/api/v1`).
-- Слоистая архитектура (API → Service → Model/Schema).
-- Декларативное описание бизнес-правил, хранящихся в БД.
-
-> ⚠️ **Внимание:** это ранний MVP. В коде присутствуют **критические уязвимости
-> и логические ошибки** (см. раздел [«Результаты код-ревью»](#-результаты-код-ревью)).
-> Проект **не готов к продакшену** в текущем виде.
+Операнд для арифметики = `context[source]` (если задан `source`), иначе текущее
+накопленное значение по `target`. `target` — имя выходного поля результата.
 
 ---
 
-## 🛠 Технологический стек
+## Поведение движка
 
-| Категория            | Технология        | Версия     |
-|----------------------|-------------------|------------|
-| Язык                 | Python            | 3.13       |
-| Web-фреймворк        | FastAPI           | 0.138.1    |
-| ASGI-сервер          | Uvicorn           | 0.49.0     |
-| ORM                  | SQLAlchemy        | 2.0.51     |
-| Валидация / схемы    | Pydantic          | 2.13.4     |
-| Настройки            | pydantic-settings | 2.14.2     |
-| База данных          | SQLite            | (встроенная) |
-| Конфигурация         | python-dotenv     | 1.2.2      |
-| Мониторинг (не подкл.)| sentry-sdk       | 2.63.0     |
-
-**Точки входа:**
-- `backend/app/main.py` — инициализация FastAPI-приложения.
-- `backend/app/api/v1/router.py` — корневой роутер v1.
-
-**База данных:** SQLite (файл `backend/database.db`), доступ через ORM SQLAlchemy.
-Таблицы: `rules`, `orders`, `order_items`.
+- **AND** — истинно, если истинны все условия; **OR** — если хотя бы одно.
+  Пустой список условий: AND → `true`, OR → `false`.
+- **Отсутствующая/деактивированная переменная** в условии трактуется как `false`
+  (никаких `KeyError`).
+- **Несравнимые типы** (например число со строкой) → условие `false`.
+- **Некорректный операнд** действия (не число / `None`) → действие пропускается,
+  движок не падает.
+- **Приоритет и конфликт**: правила применяются по возрастанию `priority`
+  (меньше = раньше). Если два правила пишут в один `target`, **побеждает применённое
+  последним** — правило с бóльшим номером `priority` перезаписывает результат (`dict.update`).
 
 ---
 
-## 🚀 Быстрый старт
+## Валидация правил
 
-### Требования
-- **Python 3.13+**
-- pip (или venv)
-- ОС: Windows / Linux / macOS
+При создании правила `validate_rule_variables` проверяет, что все `variable`
+(условия), `source` и `target` (действия) существуют в реестре
+(`build_registry` = системные + активные кастомные). Иначе — **HTTP 422** с перечнем
+неизвестных переменных.
 
-### Установка
+---
+
+## API
+
+Базовый префикс — `/api/v1`. Интерактивная документация: `GET /docs`.
+
+### Переменные
+
+#### `POST /api/v1/variables/` — создать кастомную переменную
+
+Входная переменная (читается из `metadata_json`):
 
 ```bash
-# 1. Клонировать репозиторий
-git clone <repository-url>
-cd mvp-akp/backend
-
-# 2. Создать и активировать виртуальное окружение
-python -m venv venv
-# Windows:
-venv\Scripts\activate
-# Linux/macOS:
-source venv/bin/activate
-
-# 3. Установить зависимости
-pip install -r requirements.txt
+curl -X POST http://localhost:8000/api/v1/variables/ \
+  -H "Content-Type: application/json" \
+  -d '{
+        "key": "loyalty_level",
+        "label": "Уровень лояльности",
+        "value_type": "string",
+        "source_path": "customer.loyalty.level",
+        "enum_values": ["silver", "gold", "platinum"]
+      }'
 ```
 
-> ⚠️ Файл `requirements.txt` сохранён в кодировке **UTF-16** (с BOM). Если pip
-> выдаёт ошибку чтения — пересохраните файл в UTF-8:
-> `python -c "open('requirements.txt','w',encoding='utf-8').write(open('requirements.txt',encoding='utf-16').read())"`
-
-### Конфигурация
-
-Создайте файл `backend/.env` (или используйте существующий):
-
-```env
-DATABASE_URL=sqlite:///./database.db
+```json
+{
+  "key": "loyalty_level",
+  "label": "Уровень лояльности",
+  "value_type": "string",
+  "source_path": "customer.loyalty.level",
+  "enum_values": ["silver", "gold", "platinum"],
+  "id": 1,
+  "is_active": true,
+  "created_at": "2026-07-06T10:00:00"
+}
 ```
 
-### Запуск
+Выходная переменная (только как `target`, без `source_path`):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/variables/ \
+  -H "Content-Type: application/json" \
+  -d '{"key": "discount", "label": "Скидка", "value_type": "number"}'
+```
+
+Ошибка при дубликате `key` → **409**.
+
+#### `GET /api/v1/variables/` — объединённый список (system + custom)
+
+```bash
+curl http://localhost:8000/api/v1/variables/
+```
+
+```json
+{
+  "variables": [
+    {"key": "total",         "label": "Сумма заказа",       "value_type": "number", "enum": null, "source": "system"},
+    {"key": "status",        "label": "Статус заказа",      "value_type": "string", "enum": null, "source": "system"},
+    {"key": "items_count",   "label": "Количество товаров", "value_type": "number", "enum": null, "source": "system"},
+    {"key": "loyalty_level", "label": "Уровень лояльности", "value_type": "string", "enum": ["silver","gold","platinum"], "source": "custom"},
+    {"key": "discount",      "label": "Скидка",             "value_type": "number", "enum": null, "source": "custom"}
+  ],
+  "total": 5
+}
+```
+
+### Правила
+
+#### `POST /api/v1/rules/` — создать правило
+
+```bash
+curl -X POST http://localhost:8000/api/v1/rules/ \
+  -H "Content-Type: application/json" \
+  -d '{
+        "name": "Скидка 10% для gold от 5000",
+        "priority": 10,
+        "condition": {
+          "operator": "AND",
+          "conditions": [
+            {"variable": "total", "op": ">", "value": 5000},
+            {"variable": "loyalty_level", "op": "==", "value": "gold"}
+          ]
+        },
+        "action": {
+          "actions": [
+            {"target": "discount", "op": "percent_of", "source": "total", "value": 10}
+          ]
+        }
+      }'
+```
+
+```json
+{
+  "name": "Скидка 10% для gold от 5000",
+  "condition": { "operator": "AND", "conditions": [ ... ] },
+  "action": { "actions": [ ... ] },
+  "priority": 10,
+  "is_active": true,
+  "id": 1,
+  "created_at": "2026-07-06T10:05:00"
+}
+```
+
+Ссылка на несуществующую переменную → **422**:
+
+```json
+{ "detail": "Неизвестные переменные: ghost_var" }
+```
+
+#### Остальные операции с правилами
+
+| Метод | Путь | Назначение |
+|---|---|---|
+| `GET` | `/api/v1/rules/` | список (`skip`, `limit`, `active_only`), отсортирован по `priority` |
+| `GET` | `/api/v1/rules/{id}` | получить правило (404, если нет) |
+| `PATCH` | `/api/v1/rules/{id}` | частичное обновление |
+| `DELETE` | `/api/v1/rules/{id}` | жёсткое удаление (204) |
+| `POST` | `/api/v1/rules/{id}/toggle` | инвертировать `is_active` |
+
+### Заказы
+
+#### `POST /api/v1/orders/` — создать заказ и прогнать правила
+
+```bash
+curl -X POST http://localhost:8000/api/v1/orders/ \
+  -H "Content-Type: application/json" \
+  -d '{
+        "total": 6000,
+        "status": "paid",
+        "items_count": 2,
+        "metadata": {"customer": {"loyalty": {"level": "gold"}}}
+      }'
+```
+
+Совпадение (total > 5000 и gold) → скидка 10% от 6000 = 600:
+
+```json
+{
+  "id": 1,
+  "total": 6000.0,
+  "status": "paid",
+  "items_count": 2,
+  "metadata_json": {"customer": {"loyalty": {"level": "gold"}}},
+  "created_at": "2026-07-06T10:10:00",
+  "applied_actions": {"discount": 600.0}
+}
+```
+
+Без совпадения (например `level = silver`) — `"applied_actions": {}`.
+
+---
+
+## Запуск
 
 ```bash
 cd backend
+python -m pip install -r requirements.txt
 uvicorn app.main:app --reload
+# http://localhost:8000/docs
 ```
 
-Приложение поднимется на `http://127.0.0.1:8000`.
-При старте автоматически создаются таблицы (`Base.metadata.create_all`).
+> ⚠️ Схема БД менялась относительно ранних версий. При апгрейде удалите старый
+> `database.db` — миграций пока нет, таблицы создаются автоматически при старте
+> (`init_database`).
 
-### Документация API
-- Swagger UI: `http://127.0.0.1:8000/docs`
-- ReDoc: `http://127.0.0.1:8000/redoc`
+### Настройки
+
+`app/core/config.py` читает `DATABASE_URL` (по умолчанию `sqlite:///./database.db`),
+можно переопределить через `.env` или переменную окружения.
 
 ---
 
-## 📡 API Endpoints
+## Тесты
 
-### Правила (`/api/v1/rules`)
+Юнит-тесты движка (чистый Python, без БД):
 
-| Метод  | Путь                      | Описание                          |
-|--------|---------------------------|-----------------------------------|
-| POST   | `/api/v1/rules/`          | Создать правило                   |
-| GET    | `/api/v1/rules/`          | Список правил (skip, limit, active_only) |
-| GET    | `/api/v1/rules/{id}`      | Получить правило по ID            |
-| PATCH  | `/api/v1/rules/{id}`      | Обновить правило                  |
-| DELETE | `/api/v1/rules/{id}`      | Удалить правило                   |
-| POST   | `/api/v1/rules/{id}/toggle` | Включить/выключить правило      |
-
-**Пример создания правила:**
-```json
-POST /api/v1/rules/
-{
-  "name": "Скидка для крупных заказов",
-  "condition": "total > 1000",
-  "action": "discount = total * 0.1",
-  "is_active": true
-}
+```bash
+cd backend
+python -m pip install -r requirements-dev.txt   # ставит pytest
+python -m pytest tests/ -v
 ```
 
-### Заказы (`/api/v1/orders`)
-
-| Метод | Путь               | Описание                       |
-|-------|--------------------|--------------------------------|
-| POST  | `/api/v1/orders/`  | Создать заказ и применить правила |
-
-**Пример:**
-```json
-POST /api/v1/orders/
-{
-  "client_id": 1,
-  "client_type": "vip",
-  "items": [
-    { "product_name": "Товар A", "quantity": 3, "price": 500 }
-  ],
-  "shipping_address": "ул. Примерная, 1"
-}
-```
-Ответ:
-```json
-{ "message": "Order created", "applied_actions": { "discount": 150 } }
-```
+Покрыто: несуществующая переменная в условии, AND/OR и пустой список условий,
+несравнимые типы, все операции действий (`set/add/subtract/multiply/percent_of`),
+некорректные операнды, порядок по `priority` и конфликт двух правил на один `target`.
 
 ---
 
-## 🏗 Архитектура и структура проекта
+## Возможные доработки
 
-```
-backend/
-├── app/
-│   ├── main.py              # Точка входа, создание FastAPI
-│   ├── api/v1/
-│   │   ├── router.py        # Корневой роутер v1
-│   │   └── endpoints/
-│   │       ├── rules.py     # CRUD-эндпоинты правил
-│   │       └── orders.py    # Создание заказа
-│   ├── core/
-│   │   ├── config.py        # Настройки (pydantic-settings)
-│   │   └── connection.py    # Engine, SessionLocal, get_db, Base
-│   ├── models/              # ORM-модели (SQLAlchemy)
-│   │   ├── rule.py
-│   │   └── order.py
-│   ├── schemas/             # Pydantic-схемы (DTO)
-│   │   ├── rule.py
-│   │   └── order.py
-│   └── services/            # Бизнес-логика
-│       ├── rule_service.py  # CRUD-логика правил
-│       └── rule_engine.py   # Движок применения правил
-├── requirements.txt
-├── .env
-└── database.db
-```
+**Функциональность**
+- **CRUD переменных в API**: сейчас в роутере только `POST`/`GET`. Обновление,
+  мягкое/жёсткое удаление и проверка использования (`find_rules_using`) реализованы в
+  `VariableService`, но не проброшены в эндпоинты — добавить `PATCH`/`DELETE /variables/{key}`.
+- **Настраиваемая стратегия конфликта**: сейчас захардкожена перезапись по приоритету.
+  Вынести выбор (перезапись / суммирование / максимум) на уровень правила или таргета.
+- **Вложенные группы условий** (сейчас только плоский AND/OR).
+- **Предпросмотр/симуляция** правила на тестовом заказе без сохранения.
+- **Логирование прогонов**: какие правила сработали для конкретного заказа (аудит).
 
-**Архитектурный паттерн:** слоистая (layered) архитектура с разделением
-на **API → Service → Model/Schema**. Это упрощённый вариант чистой архитектуры:
-- **API-слой** (`endpoints`) — обработка HTTP, валидация через Pydantic.
-- **Сервисный слой** (`services`) — бизнес-логика, инкапсулирует работу с БД.
-- **Слой данных** (`models`) — ORM-сущности.
-- **Схемы** (`schemas`) — контракты ввода/вывода.
+**Надёжность и качество**
+- **Миграции БД** (Alembic) вместо `create_all` + ручного удаления `database.db`.
+- **Транзакционность `process_order`**: сейчас заказ коммитится до прогона правил —
+  при желании не сохранять «пустые» прогоны или сохранять результат действий вместе с заказом.
+- **Валидация `enum_values` в условиях**: проверять, что `value` строковой переменной с
+  `enum_values` входит в допустимый список.
+- **Валидация совместимости оператора и типа** переменной (например `>` для строк).
+- **Интеграционные тесты** на роутеры и сервисы (сейчас юнит-тесты только на движок).
 
-### Бизнес-сущности и связи
-- **Rule** — правило (`name`, `condition`, `action`, `is_active`, `created_at`).
-- **Order** — заказ (`client_id`, `total_amount`, `discount`, `final_amount`,
-  `status`, `shipping_address`); связь 1-ко-многим с **OrderItem**.
-- **OrderItem** — позиция заказа (`product_name`, `quantity`, `price`,
-  `total_price`); FK → `Order`.
-
----
-
-## 🔍 Результаты код-ревью
-
-### 🔴 Критические проблемы (требуют немедленного исправления)
-
-#### 1. Удалённое выполнение кода через `eval()` — RCE
-`app/services/rule_engine.py` использует `eval()` для вычисления условий и
-действий, хранящихся в БД как строки:
-```python
-condition_result = eval(rule.condition, {}, data)
-value = eval(action_parts[1].strip(), {}, data)
-```
-Любой, кто может создать правило (а эндпоинт `POST /rules` **не защищён
-аутентификацией**), может выполнить **произвольный Python-код** на сервере,
-например `__import__('os').system('rm -rf ...')`. Передача `{}` в качестве
-globals **не отключает** доступ к `__builtins__`.
-**Это самая серьёзная уязвимость проекта.**
-> **Рекомендация:** заменить `eval` на безопасный парсер выражений
-> (например, `ast.literal_eval` для значений + собственный whitelist-интерпретатор
-> операторов, либо библиотеки `asteval`, `simpleeval`, `numexpr`). Разрешить
-> только заранее определённый набор переменных и операторов.
-
-#### 2. Логическая ошибка: переменная `result` в `process_rules`
-```python
-for rule in rules:
-    ...
-    result = {}          # ← сбрасывается на каждой итерации
-    if condition_result:
-        ...
-        result[field] = value
-return result            # ← вне цикла
-```
-Проблемы:
-- `result` объявлена **внутри** цикла → если активных правил нет (`rules`
-  пуст), `return result` бросит **`NameError`/`UnboundLocalError`**.
-- `result = {}` **обнуляется на каждой итерации** → сохраняется действие только
-  **последнего** сработавшего правила, остальные теряются.
-> **Рекомендация:** инициализировать `result = {}` **до** цикла, не сбрасывать
-> внутри; накапливать применённые действия и (опционально) применять их к `data`
-> между правилами.
-
-#### 3. Заказ не сохраняется в БД
-В `endpoints/orders.py` заказ только считается и прогоняется через правила, но
-**никогда не записывается** в таблицы `orders`/`order_items`. Модели `Order`,
-`OrderItem`, схема `OrderResponse` объявлены, но **не используются**. Поле
-`OrderItem.total_price` нигде не заполняется.
-> **Рекомендация:** реализовать `OrderService` (по аналогии с `RuleService`),
-> сохранять заказ и позиции в транзакции, применять скидку к `final_amount`.
-
-### 🟠 Высокий приоритет
-
-- **Отсутствует аутентификация и авторизация.** Все эндпоинты (включая создание
-  правил с `eval`) открыты. В сочетании с проблемой №1 — критично.
-- **Отсутствует CORS-middleware.** Любой фронтенд получит ошибки CORS.
-- **Нет тестов.** В проекте **полностью отсутствуют автотесты** (нет `tests/`,
-  pytest не настроен, хотя `.gitignore` уже готов к `.pytest_cache`/`.coverage`).
-  См. раздел [«Рекомендации»](#-рекомендации-и-roadmap).
-- **Логирование через `print()`.** `rule_engine.py` логирует ошибки в stdout
-  (`print(f"Error in rule ...")`). `sentry-sdk` есть в зависимостях, но **не
-  инициализирован**.
-- **Нет миграций БД.** Схема создаётся через `create_all()`. При изменении
-  моделей данные/структура рассинхронизируются. Нет Alembic.
-
-### 🟡 Средний приоритет
-
-- **Побочный эффект при импорте.** `init_database()` вызывается на верхнем уровне
-  `main.py` — выполняется при импорте модуля. Лучше перенести в
-  `lifespan`/`startup`-событие FastAPI.
-- **Несогласованность async/sync.** `create_order` объявлен `async`, но
-  использует синхронную сессию SQLAlchemy и блокирующие запросы — преимуществ от
-  `async` нет, есть риск блокировки event loop.
-- **Дублирование фильтра `is_active == True`.** Логика «только активные» есть и в
-  `RuleService.get_all`, и в `RuleEngine.process_rules` — нарушение DRY.
-- **`requirements.txt` в кодировке UTF-16.** Может ломать установку на части
-  окружений; стоит пересохранить в UTF-8.
-- **Обработка ошибок в движке «проглатывает» исключения** (`except Exception:
-  continue`) — ошибочное правило молча игнорируется без обратной связи
-  пользователю/в лог-систему.
-- **Отсутствует валидация выражений `condition`/`action`** на этапе создания
-  правила — невалидное правило обнаружится только в рантайме движка.
-
-### 🟢 Низкий приоритет / стиль
-
-- Модель `Rule.condition`/`action` используют `String` без ограничения длины
-  (для SQLite не критично, для других СУБД желательно).
-- `OrderResponse` и Pydantic-схема `OrderItem` объявлены, но не задействованы.
-- Мало docstring-ов в сервисах и движке; бизнес-логика движка описана только в
-  `backend/README.md`.
-- Файл `backend/database.db` присутствует в рабочем каталоге (в git **не
-  отслеживается** благодаря `.gitignore` — это корректно).
-
-### Оценка по принципам
-
-| Принцип | Оценка | Комментарий |
-|---------|--------|-------------|
-| **SOLID** | ⚠️ Частично | Хорошее разделение слоёв (SRP), но движок смешивает парсинг, вычисление и применение действий. |
-| **DRY**   | ⚠️ | Дублирование фильтра активных правил. |
-| **KISS**  | ✅/⚠️ | Код простой, но `eval` — «слишком простое» и опасное решение. |
-| **Безопасность** | 🔴 | `eval` + отсутствие auth. |
-| **Производительность** | ✅ | Объём данных мал; критичных проблем нет (кроме блокирующего async). |
-| **Читаемость** | ✅ | Код компактный и понятный. |
-
----
-
-## 🧪 Тестирование
-
-> **На текущий момент в проекте НЕТ ни одного теста.**
-
-Это существенный риск: критические баги (`result`, `eval`, несохранение заказа)
-не были бы пойманы ни одним автоматическим тестом. Рекомендуется в первую очередь
-закрыть тестами именно движок правил и сервисный слой.
-
-### Предлагаемый план внедрения тестов
-1. Добавить зависимости: `pytest`, `pytest-cov`, `httpx` (уже установлен) для
-   `TestClient`.
-2. Структура:
-   ```
-   backend/tests/
-   ├── conftest.py             # фикстуры: тестовая БД (in-memory SQLite), TestClient
-   ├── test_rule_service.py    # CRUD-логика правил
-   ├── test_rule_engine.py     # ⚠️ приоритет: условия, действия, edge-cases
-   └── test_api_rules.py       # интеграционные тесты эндпоинтов
-   ```
-3. Обязательные сценарии для `RuleEngine`:
-   - правило срабатывает / не срабатывает;
-   - **нет активных правил** (проверка бага с `NameError`);
-   - **несколько сработавших правил** (проверка потери действий);
-   - некорректное выражение в `condition`/`action`;
-   - проверка отсутствия инъекций после замены `eval`.
-4. Запуск: `pytest --cov=app`.
-5. Целевое покрытие MVP: **70%+**, для движка правил — **90%+**.
-
----
-
-## 📋 Рекомендации и Roadmap
-
-### Срочно (блокеры безопасности и корректности)
-1. 🔴 Заменить `eval()` на безопасный интерпретатор выражений.
-2. 🔴 Исправить инициализацию `result` в `RuleEngine.process_rules`.
-3. 🔴 Реализовать сохранение заказа (`OrderService`) и применение скидки.
-4. 🔴 Добавить аутентификацию/авторизацию для управления правилами.
-
-### Высокий приоритет
-5. Добавить автоматические тесты (см. раздел «Тестирование»).
-6. Настроить структурированное логирование (модуль `logging`) и инициализировать
-   Sentry.
-7. Подключить CORS-middleware.
-8. Внедрить Alembic для миграций.
-
-### Среднесрочно
-9. Перенести `init_database()` в `lifespan`-обработчик.
-10. Привести `create_order` к согласованной модели (sync-эндпоинт или
-    async-драйвер БД).
-11. Устранить дублирование фильтра активных правил.
-12. Добавить валидацию выражений правил при создании.
-13. Пересохранить `requirements.txt` в UTF-8.
-
-### Перспектива
-14. Поддержка более богатого DSL для правил (приоритеты, цепочки действий,
-    логические операторы AND/OR).
-15. Контейнеризация (Dockerfile + docker-compose), переход на PostgreSQL для
-    продакшена.
-16. CI/CD-пайплайн (линтер `ruff`/`flake8`, `mypy`, прогон тестов).
-
----
-
-## 📦 Зависимости
-
-Полный список — в `backend/requirements.txt`. Ключевые перечислены в разделе
-[«Технологический стек»](#-технологический-стек). Потенциально лишние / не
-используемые в коде, но присутствующие в зависимостях: `sentry-sdk` (не
-инициализирован), `jinja2`, `python-multipart` (шаблоны/формы не используются) —
-рекомендуется пересмотреть и удалить неиспользуемые пакеты.
-
----
-
-## 📄 Лицензия
-
-Лицензия не указана. Рекомендуется добавить файл `LICENSE`.
+**Инфраструктура**
+- **Аутентификация/авторизация** админских эндпоинтов (создание правил и переменных).
+- **CORS** и конфигурация окружений (dev/prod).
+- **Пагинация и фильтры** для списков правил/переменных, единый формат ошибок.

@@ -2,23 +2,21 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.core.connection import get_db
-from app.services.rule_engine import RuleEngine
-
-from app.schemas.order import OrderCreate
+from app.schemas.order import OrderCreate, OrderResponse
+from app.services.rule_service import RuleService
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
-@router.post("/", status_code=201)
-async def create_order(
-    order_data: OrderCreate,
-    db: Session = Depends(get_db)
-):
-    total_amount = sum(item.quantity * item.price for item in order_data.items)
 
-    engine = RuleEngine(db)
-    processed_data = engine.process_rules({"total": total_amount})
-    
-    return {
-        "message": "Order created",
-        "applied_actions": processed_data
-    }
+@router.post("/", response_model=OrderResponse, status_code=201)
+def create_order(
+    order_data: OrderCreate,
+    db: Session = Depends(get_db),
+):
+    """Создать заказ и прогнать активные правила через движок."""
+    service = RuleService(db)
+    order, applied_actions = service.process_order(order_data)
+
+    response = OrderResponse.model_validate(order)
+    response.applied_actions = applied_actions
+    return response

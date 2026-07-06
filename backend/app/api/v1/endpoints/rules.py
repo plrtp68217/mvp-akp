@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.core.connection import get_db
 from app.schemas.rule import RuleCreate, RuleUpdate, RuleResponse, RuleList
-from app.services.rule_service import RuleService
+from app.services.rule_service import RuleService, RuleValidationError
 
 router = APIRouter(prefix="/rules", tags=["rules"])
 
@@ -15,7 +15,10 @@ def create_rule(
 ):
     """Создать новое правило"""
     service = RuleService(db)
-    return service.create(rule)
+    try:
+        return service.create(rule)
+    except RuleValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 @router.get("/", response_model=RuleList)
 def get_rules(
